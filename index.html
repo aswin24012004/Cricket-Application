@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Pocket Stumps</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;height:100%;background:#0b1a10;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;touch-action:none}
+  #wrap{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+  canvas{display:block;width:100%;height:100%}
+  #ov{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;
+      background:rgba(6,20,12,.88);color:#fff;padding:6%;gap:.7em}
+  #ov h1{margin:0;font-size:2em;letter-spacing:.04em}
+  #ov h2{margin:0;font-size:1.5em}
+  #ov p{margin:0;opacity:.85;font-size:1em;line-height:1.4}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.6em;width:100%;max-width:18em}
+  .btn{border:0;border-radius:.8em;padding:.8em 1em;font-size:1em;font-weight:700;color:#08210f;background:#7CFC9A;cursor:pointer}
+  .btn.alt{background:#ffd54a}
+  .btn.ghost{background:#ffffff22;color:#fff}
+  .btn:active{transform:scale(.96)}
+  #menuBtn{position:absolute;right:2%;top:1.2%;width:2.4em;height:2.4em;border-radius:50%;border:0;background:#ffffff22;color:#fff;font-size:1em;display:none}
+  .stat{font-size:.85em;opacity:.7}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <button id="menuBtn" onclick="quit()">✕</button>
+  <div id="ov"></div>
+</div>
+
+<script>
+"use strict";
+const W = 360, H = 640;
+const wrap = document.getElementById('wrap'), cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const ov = document.getElementById('ov'), menuBtn = document.getElementById('menuBtn');
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H), dpr = window.devicePixelRatio || 1;
+  wrap.style.width = W * s + 'px'; wrap.style.height = H * s + 'px';
+  cv.width = W * s * dpr; cv.height = H * s * dpr;
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+  wrap.style.fontSize = (16 * s) + 'px';
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- audio ---------- */
+let ac = null;
+function beep(f, d, type, vol) {
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || 'sine'; o.frequency.value = f;
+    g.gain.value = vol || .08; g.gain.exponentialRampToValueAtTime(.0001, ac.currentTime + d);
+    o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + d);
+  } catch (e) {}
+}
+function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+/* ---------- state ---------- */
+const PX = 130, PW = 100, PT = 175, PB = 575, PH = PB - PT;   // pitch rect
+const BAT_X = 180;
+const S = {
+  overs: 5, inn: 1, role: 'bat', runs: 0, wk: 0, balls: 0, target: 0,
+  userBatFirst: true, us: 0, cs: 0, uw: 0, cw: 0,
+  hist: [], phase: 'menu', live: null, res: null, waitUntil: 0, swing: 0
+};
+const store = {
+  get() { try { return JSON.parse(localStorage.getItem('pocketstumps')) || { p: 0, w: 0, best: 0 }; } catch (e) { return { p: 0, w: 0, best: 0 }; } },
+  set(v) { try { localStorage.setItem('pocketstumps', JSON.stringify(v)); } catch (e) {} }
+};
+
+function pick(tbl) {
+  let r = Math.random(), a = 0;
+  for (const [k, p] of tbl) { a += p; if (r < a) return k; }
+  return tbl[tbl.length - 1][0];
+}
+const now = () => performance.now();
+
+/* ---------- menu / overlays ---------- */
+function showOv(html) { ov.innerHTML = html; ov.style.display = 'flex'; }
+function hideOv() { ov.style.display = 'none'; }
+
+function menu() {
+  S.phase = 'menu'; menuBtn.style.display = 'none';
+  const st = store.get();
+  showOv(`
+    <h1>🏏 POCKET STUMPS</h1>
+    <p>Choose match length</p>
+    <div class="grid">
+      ${[1, 2, 5, 10, 20].map(o => `<button class="btn" onclick="startMatch(${o})">${o}<br><small>over${o > 1 ? 's' : ''}</small></button>`).join('')}
+      <button class="btn ghost" onclick="howTo()">?<br><small>How</small></button>
+    </div>
+    <div class="stat">Played ${st.p} · Won ${st.w} · Best score ${st.best}</div>`);
+}
+function howTo() {
+  showOv(`
+    <h2>How to play</h2>
+    <p><b>Batting:</b> tap when the ball reaches the glowing ring. Perfect timing = 6 or 4. Too early or late = singles, dots or wickets.</p>
+    <p><b>Bowling:</b> a ball moves up and down the pitch. Tap to drop it.<br>
+    🟢 Green = 0, 1, 2 runs (centre of green can take a wicket)<br>
+    🟡 Yellow = 2 or 3 runs<br>
+    🔴 Red = 4 or 6 runs</p>
+    <button class="btn" onclick="menu()">Got it</button>`);
+}
+function quit() { if (confirm('Quit this match?')) menu(); }
+
+function startMatch(o) {
+  S.overs = o; S.userBatFirst = Math.random() < .5; S.us = S.cs = S.uw = S.cw = 0;
+  menuBtn.style.display = 'block';
+  showOv(`
+    <h2>${o} over match</h2>
+    <p>${S.userBatFirst ? 'You won the toss and will <b>bat</b> first.' : 'CPU won the toss and will bat first. You <b>bowl</b>.'}</p>
+    <button class="btn" onclick="startInnings(1)">Play</button>`);
+}
+
+function startInnings(n) {
+  S.inn = n; S.role = ((n === 1) === S.userBatFirst) ? 'bat' : 'bowl';
+  S.runs = 0; S.wk = 0; S.balls = 0; S.hist = []; S.res = null; S.live = null;
+  hideOv(); queueBall(900);
+}
+
+function queueBall(ms) { S.phase = 'wait'; S.waitUntil = now() + ms; }
+
+function beginBall() {
+  S.phase = 'live';
+  if (S.role === 'bat') {
+    S.live = { t0: now(), D: 1000 + Math.random() * 700, sway: (Math.random() - .5) * 34 };
+  } else {
+    S.live = { t0: now(), speed: .5 + Math.random() * .4, ph: Math.random() };
+  }
+}
+
+/* ---------- input ---------- */
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (S.phase !== 'live') return;
+  if (S.role === 'bat') resolveBat(); else resolveBowl();
+});
+
+/* ---------- batting ---------- */
+const IDEAL = .85;
+function resolveBat(missed) {
+  const L = S.live, t = (now() - L.t0) / L.D, e = t - IDEAL, a = Math.abs(e);
+  S.swing = now();
+  let val, tag;
+  if (missed) { val = pick([['W', .65], [0, .35]]); tag = 'Missed!'; }
+  else if (a < .035) { val = pick([[6, .5], [4, .42], ['W', .08]]); tag = 'Perfect!'; }
+  else if (a < .075) { val = pick([[4, .38], [6, .1], [2, .24], [3, .1], [1, .14], ['W', .04]]); tag = 'Good'; }
+  else if (a < .13) { val = pick([[1, .34], [2, .28], [3, .08], [0, .12], [4, .1], ['W', .08]]); tag = 'Okay'; }
+  else if (a < .3) { val = pick([[0, .3], [1, .3], [2, .08], ['W', .32]]); tag = e < 0 ? 'Too early' : 'Too late'; }
+  else { val = pick([[0, .8], ['W', .2]]); tag = 'Swing & miss'; }
+  const ang = (-90 + Math.max(-65, Math.min(65, e * 520)) + (Math.random() - .5) * 24) * Math.PI / 180;
+  const dist = val === 6 ? 520 : val === 4 ? 420 : (typeof val === 'number' && val > 0) ? 90 + val * 28 : 25;
+  finishBall(val, tag, { ang, dist, from: { x: 205, y: 545 } });
+}
+
+/* ---------- bowling ---------- */
+function markerP() {
+  const L = S.live, x = (now() - L.t0) / 1000 * L.speed + L.ph;
+  return Math.abs(2 * (x % 1) - 1);
+}
+function zoneOf(p) { return (p < .18 || p > .82) ? 'red' : (p < .33 || p > .67) ? 'yellow' : 'green'; }
+function resolveBowl() {
+  const p = markerP(), z = zoneOf(p), perfect = Math.abs(p - .5) < .04;
+  let val;
+  if (z === 'green') val = perfect ? pick([['W', .4], [0, .4], [1, .2]]) : pick([['W', .12], [0, .4], [1, .35], [2, .13]]);
+  else if (z === 'yellow') val = pick([['W', .06], [1, .2], [2, .42], [3, .32]]);
+  else val = pick([[4, .58], [6, .42]]);
+  S.live.p = p;
+  const tag = z === 'green' ? (perfect ? 'Perfect length!' : 'Green') : z === 'yellow' ? 'Yellow' : 'Red';
+  finishBall(val, tag, { ang: (-90 + (Math.random() - .5) * 120) * Math.PI / 180, dist: val === 6 ? 520 : val === 4 ? 420 : (typeof val === 'number' && val > 0) ? 90 + val * 28 : 25, from: { x: 205, y: 545 }, p, z });
+}
+
+/* ---------- ball result ---------- */
+function finishBall(val, tag, flight) {
+  S.live.done = true;
+  S.balls++;
+  const wicket = val === 'W';
+  if (wicket) S.wk++; else S.runs += val;
+  S.hist.push(val);
+  const color = wicket ? '#ff5252' : val === 6 ? '#ffd54a' : val === 4 ? '#7CFC9A' : '#ffffff';
+  const text = wicket ? 'OUT!' : val === 6 ? 'SIX!' : val === 4 ? 'FOUR!' : val === 0 ? 'DOT' : val + (val === 1 ? ' RUN' : ' RUNS');
+  S.res = { text, tag, color, until: now() + 1150, t0: now(), val, flight };
+  S.phase = 'result';
+  if (wicket) { beep(140, .4, 'sawtooth', .1); buzz(120); }
+  else if (val >= 4) { beep(660, .15, 'triangle'); setTimeout(() => beep(880, .2, 'triangle'), 110); buzz(40); }
+  else beep(420, .08, 'square', .05);
+}
+
+function afterResult() {
+  const over = S.wk >= 10 || S.balls >= S.overs * 6 || (S.inn === 2 && S.runs >= S.target);
+  if (over) endInnings(); else queueBall(450);
+}
+
+function endInnings() {
+  S.phase = 'overlay';
+  if (S.role === 'bat') { S.us = S.runs; S.uw = S.wk; } else { S.cs = S.runs; S.cw = S.wk; }
+  if (S.inn === 1) {
+    S.target = S.runs + 1;
+    showOv(`
+      <h2>Innings over</h2>
+      <p style="font-size:1.6em"><b>${S.runs}/${S.wk}</b></p>
+      <p>Target: <b>${S.target}</b> in ${S.overs} over${S.overs > 1 ? 's' : ''}</p>
+      <p>${S.role === 'bat' ? 'Now you <b>bowl</b> and defend it.' : 'Now you <b>bat</b> and chase it.'}</p>
+      <button class="btn" onclick="startInnings(2)">Continue</button>`);
+    return;
+  }
+  let msg, win = false;
+  if (S.role === 'bat') {            // user chased
+    if (S.runs >= S.target) { win = true; msg = `You won by ${10 - S.wk} wicket${10 - S.wk === 1 ? '' : 's'}!`; }
+    else if (S.runs === S.target - 1) msg = 'Match tied!';
+    else msg = `You lost by ${S.target - 1 - S.runs} run${S.target - 1 - S.runs === 1 ? '' : 's'}.`;
+  } else {                           // user defended
+    if (S.runs >= S.target) msg = `CPU won by ${10 - S.wk} wicket${10 - S.wk === 1 ? '' : 's'}.`;
+    else if (S.runs === S.target - 1) msg = 'Match tied!';
+    else { win = true; msg = `You won by ${S.target - 1 - S.runs} runs!`; }
+  }
+  const st = store.get(); st.p++; if (win) st.w++; st.best = Math.max(st.best, S.us); store.set(st);
+  showOv(`
+    <h1>${win ? '🏆' : '🏏'}</h1>
+    <h2>${msg}</h2>
+    <p>You: <b>${S.us}/${S.uw}</b> &nbsp;·&nbsp; CPU: <b>${S.cs}/${S.cw}</b></p>
+    <button class="btn" onclick="startMatch(${S.overs})">Rematch</button>
+    <button class="btn alt" onclick="menu()">Menu</button>`);
+}
+
+/* ---------- update ---------- */
+function update() {
+  const t = now();
+  if (S.phase === 'wait' && t >= S.waitUntil) beginBall();
+  else if (S.phase === 'live' && S.role === 'bat' && !S.live.done) {
+    if ((t - S.live.t0) / S.live.D > 1.02) resolveBat(true);
+  } else if (S.phase === 'result' && t >= S.res.until) afterResult();
+}
+
+/* ---------- drawing ---------- */
+function drawField() {
+  for (let i = 0; i < 16; i++) { ctx.fillStyle = i % 2 ? '#2f8f46' : '#2a8340'; ctx.fillRect(0, i * 40, W, 40); }
+  ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.ellipse(W / 2, 360, 172, 300, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#d9c28f'; ctx.fillRect(PX, PT, PW, PH);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(PX - 8, PT + 40); ctx.lineTo(PX + PW + 8, PT + 40); ctx.moveTo(PX - 8, PB - 40); ctx.lineTo(PX + PW + 8, PB - 40); ctx.stroke();
+  stumps(W / 2, PT + 6); stumps(W / 2, PB - 6);
+}
+function stumps(x, y) {
+  ctx.fillStyle = '#f3e9c6';
+  for (let i = -1; i <= 1; i++) ctx.fillRect(x + i * 7 - 1.5, y - 10, 3, 20);
+}
+function ball(x, y, r, c) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fillStyle = c || '#c62828'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x, y, r * .7, .5, 2.6); ctx.stroke();
+}
+function person(x, y, col, swing) {
+  ctx.fillStyle = col; ctx.strokeStyle = col; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(x, y - 22, 8, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(x, y - 14); ctx.lineTo(x, y + 14); ctx.moveTo(x, y + 14); ctx.lineTo(x - 7, y + 34); ctx.moveTo(x, y + 14); ctx.lineTo(x + 7, y + 34); ctx.stroke();
+  if (swing !== null) {
+    const a = -1.2 + swing * 2.6;
+    ctx.strokeStyle = '#e6c27a'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x - Math.cos(a) * 30, y - 4 + Math.sin(a) * 30 - 10); ctx.stroke();
+  }
+}
+function hud() {
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, 84);
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.font = '600 12px system-ui'; ctx.fillText(S.role === 'bat' ? 'YOU BAT' : 'YOU BOWL', 12, 20);
+  ctx.font = '800 30px system-ui'; ctx.fillText(S.runs + '/' + S.wk, 12, 52);
+  const ov_ = Math.floor(S.balls / 6) + '.' + (S.balls % 6);
+  ctx.textAlign = 'center'; ctx.font = '600 12px system-ui'; ctx.fillText('OVERS', 190, 20);
+  ctx.font = '700 20px system-ui'; ctx.fillText(ov_ + ' / ' + S.overs, 190, 46);
+  ctx.textAlign = 'right'; ctx.font = '600 12px system-ui';
+  if (S.inn === 2) {
+    const need = S.target - S.runs, left = S.overs * 6 - S.balls;
+    ctx.fillText('TARGET ' + S.target, 300, 20);
+    ctx.font = '700 13px system-ui'; ctx.fillText(Math.max(need, 0) + ' off ' + left, 300, 42);
+  } else ctx.fillText('1st innings', 300, 20);
+  // last balls chips
+  const recent = S.hist.slice(-6);
+  const cx0 = 12;
+  ctx.textAlign = 'center'; ctx.font = '700 11px system-ui';
+  recent.forEach((v, i) => {
+    const x = cx0 + 11 + i * 26;
+    ctx.fillStyle = v === 'W' ? '#ff5252' : v >= 4 ? '#7CFC9A' : '#ffffff33';
+    ctx.beginPath(); ctx.arc(x, 72, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = v >= 4 && v !== 'W' ? '#08210f' : '#fff'; ctx.fillText(v, x, 76);
+  });
+}
+function drawZones(alpha) {
+  const z = [[0, .18, '#e53935'], [.18, .33, '#fdd835'], [.33, .67, '#43a047'], [.67, .82, '#fdd835'], [.82, 1, '#e53935']];
+  ctx.globalAlpha = alpha;
+  for (const [a, b, c] of z) { ctx.fillStyle = c; ctx.fillRect(PX, PT + a * PH, PW, (b - a) * PH); }
+  ctx.fillStyle = '#c8ffd0'; ctx.fillRect(PX, PT + .46 * PH, PW, .08 * PH);
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  drawField();
+  const t = now();
+  let swing = null;
+  if (S.swing && t - S.swing < 220) swing = (t - S.swing) / 220;
+
+  if (S.role === 'bat') {
+    person(W / 2, PT - 22, '#5c6bc0', null);   // bowler
+    person(205, 560, '#fff', swing);           // you
+    if (S.phase === 'live' && S.live && !S.live.done) {
+      const L = S.live, tt = (t - L.t0) / L.D;
+      const ty = tt => 195 + tt * 365, tx = tt => BAT_X + L.sway * Math.sin(tt * Math.PI);
+      const iy = ty(IDEAL), ix = tx(IDEAL), pulse = 1 + .12 * Math.sin(t / 90);
+      ctx.strokeStyle = '#ffd54a'; ctx.lineWidth = 3; ctx.shadowColor = '#ffd54a'; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(ix, iy, 20 * pulse, 0, 7); ctx.stroke(); ctx.shadowBlur = 0;
+      ball(tx(tt), ty(tt), 4 + tt * 9);
+    }
+  } else {
+    person(W / 2, PT - 22, '#fff', null);       // you bowl
+    person(205, 560, '#ef5350', swing === null && S.phase === 'result' ? .5 : swing); // cpu batter
+    drawZones(S.phase === 'live' ? .85 : .55);
+    if (S.phase === 'live' && S.live && !S.live.done) {
+      const p = markerP(), y = PT + p * PH;
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PX - 10, y); ctx.lineTo(PX + PW + 10, y); ctx.stroke();
+      ball(W / 2, y, 9);
+    } else if (S.res && S.res.flight && S.res.flight.p !== undefined) {
+      ball(W / 2, PT + S.res.flight.p * PH, 9);
+    }
+  }
+
+  // ball flight after result
+  if (S.res && S.phase === 'result') {
+    const R = S.res, k = Math.min(1, (t - R.t0) / 700), f = R.flight;
+    if (R.val !== 'W' && R.val > 0 && !(S.role === 'bowl' && k < .02)) {
+      const e = 1 - Math.pow(1 - k, 2);
+      const x = f.from.x + Math.cos(f.ang) * f.dist * e, y = f.from.y + Math.sin(f.ang) * f.dist * e;
+      const lift = R.val === 6 ? Math.sin(k * Math.PI) * 45 : 0;
+      if (k < 1) ball(x, y - lift, R.val === 6 ? 5 + Math.sin(k * Math.PI) * 4 : 5, '#c62828');
+    }
+    const fade = Math.min(1, (R.until - t) / 300), pop = Math.min(1, (t - R.t0) / 150);
+    ctx.globalAlpha = Math.max(0, fade);
+    ctx.textAlign = 'center'; ctx.fillStyle = R.color; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+    ctx.font = `900 ${34 + 20 * (1 - Math.pow(1 - pop, 3))}px system-ui`;
+    ctx.strokeText(R.text, W / 2, 320); ctx.fillText(R.text, W / 2, 320);
+    ctx.font = '700 16px system-ui'; ctx.fillStyle = '#fff'; ctx.fillText(R.tag, W / 2, 350);
+    ctx.globalAlpha = 1;
+  }
+
+  // hints
+  ctx.textAlign = 'center'; ctx.font = '600 14px system-ui'; ctx.fillStyle = 'rgba(255,255,255,.85)';
+  if (S.phase === 'live') ctx.fillText(S.role === 'bat' ? 'TAP when the ball hits the ring' : 'TAP to drop the ball — aim for GREEN', W / 2, 622);
+  hud();
+}
+
+function loop() { update(); if (S.phase !== 'menu') draw(); else { drawField(); } requestAnimationFrame(loop); }
+menu(); loop();
+</script>
+</body>
+</html>
